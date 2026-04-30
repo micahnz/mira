@@ -15,12 +15,9 @@ Classify the human's intent and write a brief reply.
 
 ## Output
 
-Respond with strict JSON, no prose, no markdown fences:
-
-{
-  "intent": "<one of: disagreement | question | agreement | other>",
-  "reply": "<your reply, 1-2 sentences max, plain text, no markdown>"
-}
+Call the `submit_thread_reply` tool with your classification and reply.
+Do NOT write the response in the message body — the tool call is the only
+output channel.
 
 Intent guidance:
 

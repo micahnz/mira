@@ -102,6 +102,13 @@ def create_app(
     # breaking GitHub installations.
     # `/webhook` stays as a deprecated alias so existing GitHub Apps that
     # were created before the rename keep working.
+    #
+    # Stacking two `@app.post(...)` decorators registers two independent
+    # routes — FastAPI's `app.post(path)` registers the route as a side
+    # effect and returns the original callable unchanged, so the second
+    # application sees the same function and registers it again at the new
+    # path. Don't collapse these into a single decorator with a regex; the
+    # explicit form is clearer and lets us deprecate `/webhook` cleanly.
     @app.post("/github/webhook")
     @app.post("/webhook")
     async def webhook(request: Request, background_tasks: BackgroundTasks) -> Response:

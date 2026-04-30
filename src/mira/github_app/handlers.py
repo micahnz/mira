@@ -302,18 +302,22 @@ async def _handle_thread_freeform_reply(
                 logger.warning("Failed to resolve disagreement thread: %s", exc)
             try:
                 store = _open_store(owner, repo)
-                store.record_feedback(
-                    pr_number=number,
-                    pr_url=pr_info.url,
-                    comment_path=comment.get("path", ""),
-                    comment_line=comment.get("original_line", 0) or comment.get("line", 0),
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=comment["user"]["login"],
-                )
-                store.close()
+                try:
+                    store.record_feedback(
+                        pr_number=number,
+                        pr_url=pr_info.url,
+                        comment_path=comment.get("path", ""),
+                        comment_line=comment.get("original_line", 0) or comment.get("line", 0),
+                        comment_category="",
+                        comment_severity="",
+                        comment_title="",
+                        signal="rejected",
+                        actor=comment["user"]["login"],
+                    )
+                finally:
+                    # Always close the store — without this finally, a raise
+                    # inside record_feedback leaks the SQLite/Pg connection.
+                    store.close()
             except Exception as fb_err:
                 logger.debug("Failed to record disagreement feedback: %s", fb_err)
 
@@ -433,19 +437,21 @@ async def handle_thread_reject(
         # Record feedback for learning
         try:
             store = _open_store(owner, repo)
-            store.record_feedback(
-                pr_number=number,
-                pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
-                comment_path=payload["comment"].get("path", ""),
-                comment_line=payload["comment"].get("original_line", 0)
-                or payload["comment"].get("line", 0),
-                comment_category="",
-                comment_severity="",
-                comment_title="",
-                signal="rejected",
-                actor=payload["comment"]["user"]["login"],
-            )
-            store.close()
+            try:
+                store.record_feedback(
+                    pr_number=number,
+                    pr_url=f"https://github.com/{owner}/{repo}/pull/{number}",
+                    comment_path=payload["comment"].get("path", ""),
+                    comment_line=payload["comment"].get("original_line", 0)
+                    or payload["comment"].get("line", 0),
+                    comment_category="",
+                    comment_severity="",
+                    comment_title="",
+                    signal="rejected",
+                    actor=payload["comment"]["user"]["login"],
+                )
+            finally:
+                store.close()
         except Exception as fb_err:
             logger.debug("Failed to record feedback: %s", fb_err)
 
