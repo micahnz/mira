@@ -254,6 +254,12 @@ class ReviewEngine:
         # a full pre-built index). Drives the walkthrough nudge that tells
         # the user reviews will be more accurate after indexing.
         self._index_was_empty = False
+        # Captured during _build_context for the agentic tool-use path: a
+        # source fetcher and the repo tree at PR head. Both already needed
+        # for JIT, so reusing them is free. None when no provider/PR is
+        # attached (CLI / dry-run).
+        self._agentic_source_fetcher: object | None = None
+        self._agentic_repo_tree: list[str] = []
 
     async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
@@ -763,6 +769,11 @@ class ReviewEngine:
                                         "JIT: tree fetch failed: %s",
                                         exc,
                                     )
+                            # Stash for the agentic tool-use path so
+                            # _review_chunk can give the LLM read_file /
+                            # grep_repo without re-fetching the tree.
+                            self._agentic_source_fetcher = source_fetcher
+                            self._agentic_repo_tree = sorted(tree_paths) if tree_paths else []
                             jit = await build_jit_cross_file_context(
                                 changed_files=filtered,
                                 source_fetcher=source_fetcher,
@@ -927,7 +938,26 @@ class ReviewEngine:
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
                     )
-                    raw_response = await self.llm.review(messages)
+                    raw_response = ""
+                    # Agentic tool-use path: only on unindexed repos, where
+                    # the static context block is necessarily thin. Indexed
+                    # reviews already have the full picture, so the extra
+                    # hops would just slow things down.
+                    use_agentic = (
+                        self.config.review.agentic_tools
+                        and getattr(self, "_index_was_empty", False)
+                        and self._agentic_source_fetcher is not None
+                    )
+                    if use_agentic:
+                        from mira.llm.agentic_tools import AgenticToolExecutor
+
+                        executor = AgenticToolExecutor(
+                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                            repo_tree=list(self._agentic_repo_tree),
+                        )
+                        raw_response = await self._agentic_review_loop(messages, executor)
+                    if not raw_response:
+                        raw_response = await self.llm.review(messages)
                     parsed = parse_llm_response(raw_response)
                     comments = convert_to_review_comments(
                         parsed,
@@ -1028,6 +1058,99 @@ class ReviewEngine:
             skipped_paths=skipped_paths_only,
             total_paths=all_paths,
         )
+
+    async def _agentic_review_loop(
+        self,
+        messages: list[dict],
+        executor: object,
+    ) -> str:
+        """Run an agentic tool-use loop until the LLM submits a review.
+
+        Hands the model `read_file` and `grep_repo` alongside the terminal
+        `submit_review` tool. Each hop: call the model, dispatch any
+        non-terminal tool calls, append results, repeat. Caps at 6 hops so
+        a confused model can't burn unbounded tokens.
+
+        Returns the JSON args of the final `submit_review` call (same
+        shape `self.llm.review` returns), or "" if the loop exited without
+        one — caller falls back to a forced single-tool call.
+        """
+        import json as _json
+
+        from mira.llm.agentic_tools import AGENTIC_TOOLS
+        from mira.llm.provider import SUBMIT_REVIEW_TOOL
+
+        tools = [*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
+        # Augment the existing system message with a brief note on tool use.
+        # Putting it inline keeps prompt structure intact for the rest of
+        # the flow (parsing, summary regen, etc.).
+        convo: list[dict] = [dict(m) for m in messages]
+        if convo and convo[0].get("role") == "system":
+            convo[0]["content"] = (
+                convo[0]["content"] + "\n\n## Tools\n\n"
+                "This repo isn't indexed, so you have two helpers for "
+                "cross-file checks: `read_file(path)` and "
+                "`grep_repo(pattern, path_glob?, path_only?)`. Use them when, "
+                "and ONLY when, you need to verify a cross-file claim before "
+                "filing a comment (e.g. *does the called function actually "
+                "raise X?*, *is this symbol defined elsewhere?*). Don't browse — "
+                "fetch what you specifically need. Skip the tools entirely if "
+                "the diff alone is enough. Once you're ready, call "
+                "`submit_review` with all your findings."
+            )
+
+        max_hops = 6
+        for hop in range(max_hops):
+            try:
+                msg = await self.llm.complete_agentic(convo, tools=tools)
+            except Exception as exc:
+                logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
+                return ""
+
+            tool_calls = msg.get("tool_calls") or []
+            content = msg.get("content") or ""
+
+            if not tool_calls:
+                # The model ended without calling submit_review — fall back.
+                logger.debug(
+                    "Agentic loop exited at hop %d without submit_review (content=%d chars)",
+                    hop + 1,
+                    len(content),
+                )
+                return ""
+
+            # Append the assistant message verbatim so tool_call_ids resolve.
+            convo.append(
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                if name == "submit_review":
+                    return fn.get("arguments") or ""
+
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+
+                tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or "",
+                        "content": tool_result,
+                    }
+                )
+
+        logger.debug("Agentic loop hit %d-hop cap without submit_review", max_hops)
+        return ""
 
     async def _security_review_pass(
         self,

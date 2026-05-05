@@ -99,6 +99,14 @@ class ReviewConfig(BaseModel):
     # sensitive deployments.
     security_pass: bool = True
 
+    # When the repo is not indexed, give the reviewer LLM tools (`read_file`,
+    # `grep_repo`) it can call to fetch cross-file context on demand. Closes
+    # the gap on Java/Go cross-file findings that JIT pre-fetch can't reach
+    # (those languages need build-system parsing to resolve imports). Adds
+    # 1-3 extra LLM hops per chunk on unindexed reviews; no effect when the
+    # repo is indexed.
+    agentic_tools: bool = True
+
 
 class ProviderConfig(BaseModel):
     type: str = "github"

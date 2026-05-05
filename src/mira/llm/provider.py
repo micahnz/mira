@@ -458,6 +458,96 @@ class LLMProvider:
                 f"LLM completion failed with {self.config.model}: {primary_err}"
             ) from primary_err
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    async def _call_llm_agentic(
+        self,
+        model: str,
+        messages: list,
+        tools: list[dict],
+        temperature: float | None = None,
+    ) -> dict:
+        """Make a tool-using LLM call without forcing a specific tool.
+
+        Unlike `_call_llm_with_tools`, this returns the *full* assistant
+        message (with `tool_calls` and `content`) so the caller can
+        dispatch the calls and continue the conversation. This is what
+        the agentic loop needs.
+        """
+        body: dict = {
+            "model": _strip_model_prefix(model),
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": temperature if temperature is not None else self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {_get_api_key()}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/miracodeai/mira",
+            "X-Title": "Mira Code Reviewer",
+        }
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{_OPENROUTER_BASE_URL}/chat/completions",
+                headers=headers,
+                json=body,
+            )
+            if resp.status_code != 200:
+                raise LLMError(f"OpenRouter API error {resp.status_code}: {resp.text}")
+            data = resp.json()
+
+        usage = data.get("usage")
+        if usage:
+            self.total_prompt_tokens += usage.get("prompt_tokens", 0)
+            self.total_completion_tokens += usage.get("completion_tokens", 0)
+
+        return data["choices"][0]["message"]
+
+    async def complete_agentic(
+        self,
+        messages: list,
+        tools: list[dict],
+        temperature: float | None = None,
+    ) -> dict:
+        """Single hop of an agentic loop. Returns the assistant message dict.
+
+        The caller is responsible for the loop: append the message,
+        dispatch any `tool_calls`, append the tool results as `tool`-role
+        messages, and call again until the terminal tool fires.
+        """
+        try:
+            return await self._call_llm_agentic(
+                self.config.model, messages, tools, temperature=temperature
+            )
+        except Exception as primary_err:
+            if self.config.fallback_model:
+                logger.warning(
+                    "Primary model %s failed (%s), trying fallback %s",
+                    self.config.model,
+                    primary_err,
+                    self.config.fallback_model,
+                )
+                try:
+                    return await self._call_llm_agentic(
+                        self.config.fallback_model, messages, tools, temperature=temperature
+                    )
+                except Exception as fallback_err:
+                    raise LLMError(
+                        f"Both primary ({self.config.model}) and fallback "
+                        f"({self.config.fallback_model}) models failed: {fallback_err}"
+                    ) from fallback_err
+            raise LLMError(
+                f"LLM agentic call failed with {self.config.model}: {primary_err}"
+            ) from primary_err
+
     async def complete_with_tools(
         self,
         messages: list[dict[str, str]],
