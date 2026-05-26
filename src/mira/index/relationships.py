@@ -207,7 +207,6 @@ class RelationshipStore:
     def __init__(self, index_dir: str | None = None) -> None:
         self._index_dir = index_dir or os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
         self._stores: dict[str, IndexStore] = {}
-        # Org-level overrides DB
         os.makedirs(self._index_dir, exist_ok=True)
         self._overrides_db = sqlite3.connect(os.path.join(self._index_dir, "_relationships.db"))
         self._overrides_db.execute("PRAGMA journal_mode=WAL")
@@ -216,8 +215,7 @@ class RelationshipStore:
         self._scan_repos()
 
     def _scan_repos(self) -> None:
-        """Discover all indexed repos (Postgres registry or SQLite files)."""
-        # First try the Postgres repos table (via app DB)
+        """Discover indexed repos via Postgres registry, falling back to SQLite files on disk."""
         db_url = os.environ.get("DATABASE_URL", "")
         if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
             try:
@@ -236,7 +234,6 @@ class RelationshipStore:
             except Exception as exc:
                 logger.warning("Failed to scan repos from DB, falling back to filesystem: %s", exc)
 
-        # Fallback: scan filesystem for SQLite .db files
         if not os.path.isdir(self._index_dir):
             return
         for owner_dir in os.listdir(self._index_dir):
@@ -270,7 +267,6 @@ class RelationshipStore:
             if len(parts) == 2:
                 short_to_full[parts[1]] = full_name
 
-        # Load denied overrides
         denied = {
             (o.source_repo, o.target_repo) for o in self.list_overrides() if o.status == "denied"
         }
@@ -287,7 +283,6 @@ class RelationshipStore:
             for target_str in all_targets:
                 matched_repo = self._match_target_to_repo(target_str, known, short_to_full)
                 if matched_repo and matched_repo != source_repo:
-                    # Skip denied edges
                     if (source_repo, matched_repo) in denied:
                         continue
                     key = (source_repo, matched_repo, "external_ref")
@@ -299,7 +294,6 @@ class RelationshipStore:
                         )
                     edges[key].refs.extend(all_refs_by_target.get(target_str, []))
 
-        # Add custom edges
         for ce in self.list_custom_edges():
             key = (ce.source_repo, ce.target_repo, "custom")
             if key not in edges and (ce.source_repo, ce.target_repo) not in denied:
@@ -333,7 +327,6 @@ class RelationshipStore:
                     result[key] = ("dependent", [])
                 result[key][1].append(edge)
 
-        # Also add same-group repos
         groups = self.group_repos(self.repos)
         for group in groups:
             if full_name in group.repos:
@@ -357,7 +350,8 @@ class RelationshipStore:
         """
         edges = self.resolve_edges()
 
-        # Detect utility repos first — they must not bridge unrelated groups
+        # Utility repos can't bridge unrelated groups: shared-lib being a
+        # common dependency doesn't make its dependents related to each other.
         repo_deps: dict[str, set[str]] = {}
         for e in edges:
             repo_deps.setdefault(e.source_repo, set()).add(e.target_repo)
@@ -370,7 +364,6 @@ class RelationshipStore:
             pair_evidence.setdefault(pair, []).append(evidence)
             pair_scores[pair] = pair_scores.get(pair, 0.0) + score
 
-        # Skip utility repos so shared-lib doesn't bridge unrelated services.
         edge_pairs: dict[frozenset[str], list[str]] = {}
         for e in edges:
             if e.source_repo in utility_repos or e.target_repo in utility_repos:
@@ -522,7 +515,6 @@ class RelationshipStore:
         utility_names = {"shared", "common", "lib", "core", "infra", "utils", "tools", "platform"}
         utility_repos: set[str] = set()
 
-        # Count how many repos depend on each repo
         dependents_count: dict[str, int] = {}
         for _source, targets in repo_deps.items():
             for t in targets:
@@ -531,13 +523,12 @@ class RelationshipStore:
         for full_name in repo_names:
             short = full_name.split("/")[-1].lower()
 
-            # Check name
             name_parts = re.split(r"[-._]", short)
             if any(part in utility_names for part in name_parts):
                 utility_repos.add(full_name)
                 continue
 
-            # Check topology: many dependents, few dependencies
+            # Topology heuristic: many dependents, few dependencies.
             n_dependents = dependents_count.get(full_name, 0)
             n_deps = len(repo_deps.get(full_name, set()))
             if n_dependents >= 3 and n_deps <= 1:
@@ -557,16 +548,13 @@ class RelationshipStore:
                     for word in re.findall(r"[a-z]{3,}", summary.summary.lower()):
                         if word not in _STOP_WORDS:
                             words[word] += 1
-                    # Also include symbol names as domain signals
                     for sym in summary.symbols:
-                        # Split camelCase/snake_case symbol names into words
                         for part in re.findall(
                             r"[a-z]{3,}", re.sub(r"([A-Z])", r" \1", sym.name).lower()
                         ):
                             if part not in _STOP_WORDS:
                                 words[part] += 1
 
-            # Keep top keywords (frequency > 1 or strongly domain-specific)
             keywords[repo_name] = {
                 word for word, count in words.items() if count >= 1 and len(word) >= 4
             }
@@ -583,7 +571,6 @@ class RelationshipStore:
         """
         short_names = [m.split("/")[-1] for m in members]
 
-        # 1. Try naming prefix via component suffixes
         prefixes: Counter[str] = Counter()
         for short in short_names:
             prefix = self._extract_group_prefix(short)
@@ -595,14 +582,13 @@ class RelationshipStore:
             if count >= 2:
                 return best_prefix
 
-        # 2. Longest common substring of repo names
         if len(short_names) >= 2:
             common = _longest_common_prefix(short_names)
             common = common.rstrip("-._")
             if len(common) >= 3:
                 return common
 
-        # 3. Most common shared domain keyword — filter out adjectives/fluff
+        # Fall back to a shared domain keyword, filtered for marketing fluff.
         _FILLER_WORDS = {
             "comprehensive",
             "modern",
