@@ -58,11 +58,8 @@ def parse_llm_response(raw_text: str) -> LLMReviewResponse:
     """Parse raw LLM text output into a validated LLMReviewResponse."""
     cleaned = strip_code_fences(raw_text)
 
-    # strict=False permits raw control chars (newlines/tabs) inside
-    # strings — some tool-calling models occasionally double-encode the
-    # comments array as a string containing pretty-printed JSON, and
-    # that pretty-printed JSON has literal newlines that strict mode
-    # rejects.
+    # strict=False tolerates raw newlines from models that double-encode the
+    # comments array as a pretty-printed JSON string.
     try:
         data = json.loads(cleaned, strict=False)
     except json.JSONDecodeError as e:
@@ -155,8 +152,7 @@ def convert_to_review_comments(
         if c.suggestion and not c.body.strip():
             continue
 
-        # A *present* existing_code that doesn't appear in the diff is a
-        # hallucinated citation; drop. Empty citation is allowed.
+        # Drop hallucinated citations (present existing_code that isn't in the diff).
         if hunk_index and c.existing_code:
             hunk_text = hunk_index.get(c.path, "")
             if c.existing_code.strip() not in hunk_text:
